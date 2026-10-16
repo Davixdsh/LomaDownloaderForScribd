@@ -65,19 +65,32 @@ function normalizeArray(value) {
 function normalizeText(value) {
   return normalizeArray(value).join(' ').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase();
 }
+
 function isBrazilianPortuguese(metadataOrLanguage) {
   const obj = typeof metadataOrLanguage === 'object' && metadataOrLanguage !== null
-    ? metadataOrLanguage : { language: metadataOrLanguage };
+    ? metadataOrLanguage
+    : { language: metadataOrLanguage };
+
   const languages = normalizeText(obj.language);
   const regional = normalizeText([
-    ...normalizeArray(obj.country), ...normalizeArray(obj.coverage),
-    ...normalizeArray(obj.region), ...normalizeArray(obj.language),
+    ...normalizeArray(obj.country),
+    ...normalizeArray(obj.coverage),
+    ...normalizeArray(obj.region),
+    ...normalizeArray(obj.language),
     ...normalizeArray(obj.description),
   ]);
-  const languageIsPortuguese = /(^|\s)(por|pt|pt-br|pt_br|portuguese|portugues)(\s|$|-|_)/i.test(` ${languages} `)
-    || languages.includes('portugues');
-  const explicitBrazilian = /pt-br|pt_br|ptbr|brazilian portuguese|portugues brasileiro|portugues do brasil|brazil|brasil/.test(regional);
-  return languageIsPortuguese && explicitBrazilian;
+
+  const languageIsPortuguese =
+    /(^|\s)(por|pt|pt-br|pt_br|ptbr|portuguese|portugues)(\s|$|-|_)/i
+      .test(` ${languages} `) ||
+    languages.includes('portugues');
+
+  const explicitBrazilian =
+    /pt-br|pt_br|ptbr|brazilian portuguese|portugues brasileiro|portugues do brasil|brazil|brasil/
+      .test(regional);
+
+  // Aceita português genérico, sem exigir indicação regional brasileira.
+  return languageIsPortuguese;
 }
 function normalizeFormat(value) {
   const text = normalizeText(value);

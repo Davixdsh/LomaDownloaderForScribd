@@ -2,6 +2,7 @@ import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import { Readable } from 'node:stream';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 loadEnv(path.join(__dirname, '.env'));
@@ -189,7 +190,7 @@ async function inspectCandidate(doc, selectedFormats) {
       title,
       creator: pickString(meta.creator, pickString(doc.creator, 'Autor não informado')).slice(0, 200),
       year: pickString(meta.year || meta.date || doc.year, '').slice(0, 20),
-      language: 'Português do Brasil',
+      language: 'Português',
       description: stripHtml(meta.description || doc.description),
       formats,
       downloads,
@@ -218,7 +219,15 @@ async function searchDocuments({ query, format = 'all', page = 1 }) {
   const selectedFormats = requestedFormats(format);
   const escaped = escapeLucenePhrase(query);
   const params = new URLSearchParams();
-  params.set('q', `title:"${escaped}" AND mediatype:texts`);
+  const terms = escaped
+  .split(/\s+/)
+  .filter(Boolean)
+  .map(term => `title:${term}`);
+
+params.set(
+  'q',
+  `(${terms.join(' AND ')}) AND mediatype:texts`
+);
   for (const field of ['identifier', 'title', 'creator', 'description', 'language', 'coverage', 'year', 'format']) params.append('fl[]', field);
   params.append('sort[]', 'downloads desc');
   params.set('rows', String(MAX_ROWS_PER_PAGE));
@@ -283,31 +292,135 @@ function rateLimit(req, res) {
 async function handleDownload(url, res) {
   const identifier = url.searchParams.get('identifier') || '';
   const fileName = url.searchParams.get('file') || '';
+
   if (!safeIdentifier(identifier) || !safeFileName(fileName)) {
-    json(res, 400, { error: 'Identificador ou nome de arquivo inválido.' });
+    json(res, 400, {
+      error: 'Identificador ou nome de arquivo inválido.'
+    });
     return;
   }
+
   let metadata;
-  try { metadata = await fetchArchiveMetadata(identifier); }
-  catch { json(res, 404, { error: 'Não foi possível verificar o arquivo na fonte pública.' }); return; }
+
+  try {
+    metadata = await fetchArchiveMetadata(identifier);
+  } catch {
+    json(res, 404, {
+      error: 'Não foi possível verificar o arquivo na fonte pública.'
+    });
+    return;
+  }
+
   if (!isLikelyNotPrivate(metadata?.metadata)) {
-    json(res, 403, { error: 'O documento não está marcado como público.' });
+    json(res, 403, {
+      error: 'O documento não está marcado como público.'
+    });
     return;
   }
-  const file = getAllowedFiles(metadata)[0] && getAllowedFiles(metadata).find(entry => entry.name === fileName);
+
+  const file = getAllowedFiles(metadata).find(
+    entry => entry.name === fileName
+  );
+
   if (!file) {
-    json(res, 404, { error: 'Este arquivo PDF/EPUB não consta entre os arquivos públicos verificados.' });
+    json(res, 404, {
+      error: 'O arquivo PDF/EPUB público não foi encontrado.'
+    });
     return;
   }
-  const segments = file.name.split('/').map(segment => encodeURIComponent(segment)).join('/');
-  const target = `https://archive.org/download/${encodeURIComponent(identifier)}/${segments}`;
-  res.writeHead(302, {
-    Location: target,
-    'Cache-Control': 'no-store',
+
+  const segments = file.name
+    .split('/')
+    .map(segment => encodeURIComponent(segment))
+    .join('/');
+
+  const target =
+    `https://archive.org/download/${encodeURIComponent(identifier)}/${segments}`;
+
+  let response;
+
+  try {
+    response = await fetch(target, {
+      headers: {
+        'User-Agent': 'LomaDownloader/0.2.0',
+        'Accept': 'application/pdf, application/epub+zip, */*'
+      },
+      signal: AbortSignal.timeout(60_000),
+      redirect: 'follow'
+    });
+  } catch {
+    json(res, 502, {
+      error: 'Não foi possível obter o arquivo. Tente novamente.'
+    });
+    return;
+  }
+
+  if (!response.ok || !response.body) {
+    await response.body?.cancel().catch(() => {});
+    json(res, 502, {
+      error: 'A fonte pública não conseguiu fornecer o arquivo.'
+    });
+    return;
+  }
+
+  // Só aceita o domínio oficial da fonte e seus servidores de arquivos.
+  let finalUrl;
+
+  try {
+    finalUrl = new URL(response.url);
+  } catch {
+    await response.body.cancel().catch(() => {});
+    json(res, 502, {
+      error: 'Endereço de arquivo inválido.'
+    });
+    return;
+  }
+
+  const host = finalUrl.hostname.toLowerCase();
+  const trustedHost =
+    host === 'archive.org' || host.endsWith('.archive.org');
+
+  if (finalUrl.protocol !== 'https:' || !trustedHost) {
+    await response.body.cancel().catch(() => {});
+    json(res, 502, {
+      error: 'O servidor de arquivos não é confiável.'
+    });
+    return;
+  }
+
+  const contentType = file.format === 'PDF'
+    ? 'application/pdf'
+    : 'application/epub+zip';
+
+  res.writeHead(200, {
+    'Content-Type': contentType,
+    'Content-Disposition':
+      `attachment; filename="${file.name.replace(/["\\\r\n]/g, '_')}"`,
     'X-Content-Type-Options': 'nosniff',
-    'Referrer-Policy': 'no-referrer',
+    'Cache-Control': 'no-store'
   });
-  res.end();
+
+  try {
+    await new Promise((resolve, reject) => {
+      const stream = Readable.fromWeb(response.body);
+
+      stream.on('error', reject);
+      res.on('error', reject);
+      res.on('finish', resolve);
+
+      stream.pipe(res);
+    });
+  } catch (error) {
+    console.error('[LomaDownloader download]', error.message);
+
+    if (!res.headersSent) {
+      json(res, 502, {
+        error: 'Ocorreu um erro durante a transferência.'
+      });
+    } else {
+      res.destroy();
+    }
+  }
 }
 async function handleRequest(req, res) {
   if (!applyCors(req, res)) { json(res, 403, { error: 'Origem não autorizada pela configuração CORS.' }); return; }
